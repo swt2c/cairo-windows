@@ -1,0 +1,95 @@
+name: Build cairo (Windows ARM64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure CMake is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+          }
+          cmake --version
+
+      - name: Ensure MSVC ARM64 C++ build tools are installed
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if (-not $vsPath) { throw "vswhere could not find a Visual Studio installation" }
+          Write-Host "Detected Visual Studio installation at: $vsPath"
+
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          if (-not (Test-Path $installer)) { throw "vs_installer.exe not found at $installer" }
+
+          # vs_installer.exe relaunches/elevates itself, so $LASTEXITCODE after
+          # `&` isn't reliable here; use Start-Process to get a real exit code.
+          $proc = Start-Process -FilePath $installer -ArgumentList @(
+              "modify", "--installPath", "`"$vsPath`"",
+              "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+              "--quiet", "--norestart"
+          ) -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+            throw "vs_installer modify failed with exit code $($proc.ExitCode)"
+          }
+
+          "VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Sets INCLUDE/LIB/PATH for the ARM64 MSVC toolset (cl.exe/link.exe/nmake),
+      # which build-cairo-windows.sh calls directly for the pixman/cairo steps.
+      # ilammy/msvc-dev-cmd doesn't support a native ARM64 host (only x86/x64
+      # natively, plus x64/x86 -> arm/arm64 cross variants), so call
+      # vcvarsall.bat directly the same way the "ARM64 Native Tools Command
+      # Prompt for VS 2022" shortcut does, and export its environment.
+      - name: Set up MSVC developer environment (ARM64, native host)
+        shell: pwsh
+        run: |
+          $vcvarsall = Join-Path $env:VS_PATH "VC\Auxiliary\Build\vcvarsall.bat"
+          if (-not (Test-Path $vcvarsall)) { throw "vcvarsall.bat not found at $vcvarsall" }
+          $output = & cmd /c "`"$vcvarsall`" arm64 && set"
+          if ($LASTEXITCODE -ne 0) {
+            $output | ForEach-Object { Write-Host $_ }
+            throw "vcvarsall.bat arm64 failed with exit code $LASTEXITCODE"
+          }
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Verify ARM64 compiler is active
+        shell: pwsh
+        run: |
+          Write-Host "VSCMD_ARG_TGT_ARCH=$env:VSCMD_ARG_TGT_ARCH"
+          where.exe cl.exe
+          cl.exe 2>&1 | Select-Object -First 1
+
+      # This image doesn't ship MSYS2, so install it. path-type: inherit keeps
+      # the ARM64 MSVC PATH from the previous step visible inside the MSYS2 shell.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: tar make wget
+          path-type: inherit
+
+      - name: Build cairo for ARM64
+        shell: msys2 {0}
+        run: ./build-cairo-windows.sh arm64
+
+      - name: Upload built DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cairo-windows-arm64
+          path: output/**
+          if-no-files-found: error
